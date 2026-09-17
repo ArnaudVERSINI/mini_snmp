@@ -82,9 +82,7 @@ impl Message {
             .pdu
             .bindings
             .iter()
-            .map(|b| {
-                BerValue::sequence(&[BerValue::oid(&b.oid), b.value.clone()])
-            })
+            .map(|b| BerValue::sequence(&[BerValue::oid(&b.oid), b.value.clone()]))
             .collect();
         let pdu_body = BerValue::sequence(&[
             BerValue::integer(self.pdu.request_id),

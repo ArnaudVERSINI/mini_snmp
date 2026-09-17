@@ -62,11 +62,8 @@ async fn run_client(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> 
     print_varbinds(&resp.varbinds);
 
     println!("\n[GETBULK] system subtree (non_repeaters=0, max=10)");
-    let resp = tokio::time::timeout(
-        Duration::from_secs(2),
-        sess.getbulk(&[&system], 0, 10),
-    )
-    .await??;
+    let resp =
+        tokio::time::timeout(Duration::from_secs(2), sess.getbulk(&[&system], 0, 10)).await??;
     print_varbinds(&resp.varbinds);
 
     println!("\n[SET] sysContact.0 = \"ops@mini.snmp\"");

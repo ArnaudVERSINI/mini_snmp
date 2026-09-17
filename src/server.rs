@@ -30,17 +30,38 @@ pub type Store = Arc<RwLock<BTreeMap<Vec<u64>, BerValue>>>;
 /// Build the default static data set exposed by the test server.
 pub fn default_store() -> Store {
     let mut map = BTreeMap::new();
-    map.insert(vec![1, 3, 6, 1, 2, 1, 1, 1, 0], BerValue::octet_string(b"mini_snmp test server"));
-    map.insert(vec![1, 3, 6, 1, 2, 1, 1, 2, 0], BerValue::oid([1, 3, 6, 1, 4, 1, 99999, 1]));
+    map.insert(
+        vec![1, 3, 6, 1, 2, 1, 1, 1, 0],
+        BerValue::octet_string(b"mini_snmp test server"),
+    );
+    map.insert(
+        vec![1, 3, 6, 1, 2, 1, 1, 2, 0],
+        BerValue::oid([1, 3, 6, 1, 4, 1, 99999, 1]),
+    );
     map.insert(vec![1, 3, 6, 1, 2, 1, 1, 3, 0], BerValue::timeticks(123456));
-    map.insert(vec![1, 3, 6, 1, 2, 1, 1, 4, 0], BerValue::octet_string(b"admin@example.com"));
-    map.insert(vec![1, 3, 6, 1, 2, 1, 1, 5, 0], BerValue::octet_string(b"test-host"));
-    map.insert(vec![1, 3, 6, 1, 2, 1, 1, 6, 0], BerValue::octet_string(b"Rack 1"));
+    map.insert(
+        vec![1, 3, 6, 1, 2, 1, 1, 4, 0],
+        BerValue::octet_string(b"admin@example.com"),
+    );
+    map.insert(
+        vec![1, 3, 6, 1, 2, 1, 1, 5, 0],
+        BerValue::octet_string(b"test-host"),
+    );
+    map.insert(
+        vec![1, 3, 6, 1, 2, 1, 1, 6, 0],
+        BerValue::octet_string(b"Rack 1"),
+    );
     map.insert(vec![1, 3, 6, 1, 2, 1, 1, 7, 0], BerValue::integer(72));
     map.insert(vec![1, 3, 6, 1, 2, 1, 2, 1, 0], BerValue::integer(2));
     map.insert(vec![1, 3, 6, 1, 2, 1, 4, 1, 0], BerValue::unsigned32(1));
-    map.insert(vec![1, 3, 6, 1, 2, 1, 5, 1, 0], BerValue::counter32(4294967295));
-    map.insert(vec![1, 3, 6, 1, 2, 1, 6, 1, 0], BerValue::counter64(18446744073709551615));
+    map.insert(
+        vec![1, 3, 6, 1, 2, 1, 5, 1, 0],
+        BerValue::counter32(4294967295),
+    );
+    map.insert(
+        vec![1, 3, 6, 1, 2, 1, 6, 1, 0],
+        BerValue::counter64(18446744073709551615),
+    );
     Arc::new(RwLock::new(map))
 }
 
@@ -214,7 +235,17 @@ async fn send_response(
     req_id: i32,
     varbinds: Vec<(Vec<u64>, BerValue)>,
 ) -> Result<(), std::io::Error> {
-    send_response_err(socket, peer, version, community, req_id, ERR_NOERROR, 0, varbinds).await
+    send_response_err(
+        socket,
+        peer,
+        version,
+        community,
+        req_id,
+        ERR_NOERROR,
+        0,
+        varbinds,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
