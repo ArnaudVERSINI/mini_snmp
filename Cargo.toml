@@ -1,0 +1,16 @@
+[package]
+name = "mini_snmp"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal SNMP (Simple Network Management Protocol) implementation in Rust"
+license = "MIT"
+repository = "https://github.com/ArnaudVERSINI/mini_snmp"
+keywords = ["snmp", "network", "management", "protocol"]
+categories = ["network-programming"]
+readme = "README.md"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
