@@ -14,7 +14,8 @@ A minimal [SNMP](https://datatracker.ietf.org/doc/html/rfc1157) (Simple Network 
   - Builds and sends `Response` PDUs with the built-in BER encoder
   - Supports **GetRequest**, **GetNextRequest**, **GetBulkRequest** and **SetRequest**
   - Returns `NoSuchInstance` / `EndOfMibView` where appropriate
-  - Mutable store: `SET` updates the values held in memory
+  - **Only one OID is writable**: `sysContact.0` (1.3.6.1.2.1.1.4.0)
+  - Any `SET` on any other OID returns a `notWritable` error (RFC 3416)
 
 ## Building
 
@@ -22,43 +23,26 @@ A minimal [SNMP](https://datatracker.ietf.org/doc/html/rfc1157) (Simple Network 
 cargo build
 ```
 
-## Running the self-test
+## Running the server
 
-The binary launches the test server on `127.0.0.1:11161` (community `public`)
-and runs a GET / GETNEXT / GETBULK / SET self-test against it using
-`snmp2::AsyncSession`:
+The binary launches the test server on `127.0.0.1:11161` (community `public`):
 
 ```sh
 cargo run
 ```
 
-Example output:
-
-```
-SNMP server listening on 127.0.0.1:11161
-=== mini_snmp self-test against 127.0.0.1:11161 ===
-
-[GET] sysDescr.0
-  1.3.6.1.2.1.1.1.0 => OCTET STRING: mini_snmp test server
-[GET] sysUpTime.0
-  1.3.6.1.2.1.1.3.0 => TIMETICKS: 123456
-[GET] unknown OID (expect NoSuchInstance)
-  1.3.6.1.2.1.99.99.0 => NO SUCH INSTANCE
-[GETBULK] system subtree (non_repeaters=0, max=10)
-  1.3.6.1.2.1.1.1.0 => OCTET STRING: mini_snmp test server
-  ... (10 varbinds)
-[SET] sysContact.0 = "ops@mini.snmp"
-  error_status = 0 (0 = noError)
-[GET] sysContact.0 (verify SET)
-  1.3.6.1.2.1.1.4.0 => OCTET STRING: ops@mini.snmp
-```
-
-You can also point any standard SNMP client at the server, e.g.:
+It only serves requests — point any standard SNMP client at it:
 
 ```sh
 snmpget -v 2c -c public 127.0.0.1:11161 1.3.6.1.2.1.1.1.0
 snmpwalk -v 2c -c public 127.0.0.1:11161 1.3.6.1.2.1.1
 snmpbulkwalk -v 2c -c public 127.0.0.1:11161 1.3.6.1.2.1.1
+
+# writable OID
+snmpset -v 2c -c public 127.0.0.1:11161 1.3.6.1.2.1.1.4.0 s "ops@mini.snmp"
+
+# non-writable OID -> returns notWritable (error_status 11)
+snmpset -v 2c -c public 127.0.0.1:11161 1.3.6.1.2.1.1.5.0 s "renamed"
 ```
 
 ## Embedding the server

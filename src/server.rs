@@ -19,7 +19,11 @@ use crate::oid::{cmp_oid, oid_from_bytes, oid_to_vec};
 
 /// Error status codes (RFC 3416).
 const ERR_NOERROR: i64 = 0;
-const ERR_BADVALUE: i64 = 3;
+const ERR_NOTWRITABLE: i64 = 11;
+const ERR_READONLY: i64 = 17;
+
+/// The single OID which may be modified with a SET request (sysContact.0).
+const WRITABLE_OID: &[u64] = &[1, 3, 6, 1, 2, 1, 1, 4, 0];
 
 /// Maximum SNMP datagram size.
 const MAX_SNMP_SIZE: usize = 65_500;
@@ -199,13 +203,19 @@ async fn handle(
             let mut err_index = 0i64;
             for (i, (oid, val)) in bindings.iter().enumerate() {
                 let oid_vec = oid_from_bytes(oid);
+                if oid_vec.as_slice() != WRITABLE_OID {
+                    err_status = ERR_NOTWRITABLE;
+                    err_index = (i + 1) as i64;
+                    out.push((oid_vec.clone(), BerValue::no_such_instance()));
+                    break;
+                }
                 match value_from_snmp(val) {
                     Some(bv) => {
                         store.insert(oid_vec.clone(), bv.clone());
                         out.push((oid_vec.clone(), bv));
                     }
                     None => {
-                        err_status = ERR_BADVALUE;
+                        err_status = ERR_READONLY;
                         err_index = (i + 1) as i64;
                         out.push((oid_vec.clone(), BerValue::no_such_instance()));
                         break;
