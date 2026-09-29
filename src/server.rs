@@ -384,18 +384,13 @@ mod tests {
     use super::*;
     use crate::ber::BerValue as Bv;
     use crate::message::{Message, Pdu, PduType, VarBind};
-    use std::sync::OnceLock;
     use std::time::Duration;
 
-    static SERVER_ADDR: OnceLock<SocketAddr> = OnceLock::new();
-
-    async fn ensure_server() -> SocketAddr {
-        if let Some(a) = SERVER_ADDR.get() {
-            return *a;
-        }
+    /// Each test gets its own server on an ephemeral port with its own
+    /// store, so tests are fully isolated and can run in parallel.
+    async fn spawn_server() -> SocketAddr {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
-        let _ = SERVER_ADDR.set(addr);
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         std::mem::forget(tx);
         let store = default_store();
@@ -407,8 +402,7 @@ mod tests {
         addr
     }
 
-    async fn roundtrip(msg: &Message) -> Message {
-        let addr = ensure_server().await;
+    async fn roundtrip(addr: SocketAddr, msg: &Message) -> Message {
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sock.send_to(&msg.encode(), addr).await.unwrap();
         let mut buf = vec![0u8; MAX_SNMP_SIZE];
@@ -469,7 +463,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_existing_and_missing() {
-        let resp = roundtrip(&get_msg(1, &[1, 3, 6, 1, 2, 1, 1, 1, 0])).await;
+        let addr = spawn_server().await;
+        let resp = roundtrip(addr, &get_msg(1, &[1, 3, 6, 1, 2, 1, 1, 1, 0])).await;
         assert_eq!(resp.pdu.error_status, 0);
         assert_eq!(resp.pdu.bindings[0].value.tag, tag::OCTET_STRING);
         assert_eq!(
@@ -477,12 +472,13 @@ mod tests {
             b"mini_snmp test server".to_vec()
         );
 
-        let resp = roundtrip(&get_msg(2, &[1, 3, 6, 1, 2, 1, 99, 0])).await;
+        let resp = roundtrip(addr, &get_msg(2, &[1, 3, 6, 1, 2, 1, 99, 0])).await;
         assert_eq!(resp.pdu.bindings[0].value.tag, tag::NOSUCHINSTANCE);
     }
 
     #[tokio::test]
     async fn getnext_walks_store() {
+        let addr = spawn_server().await;
         let msg = Message::v2c(
             b"public",
             PduType::GetNextRequest,
@@ -496,47 +492,60 @@ mod tests {
                 }],
             },
         );
-        let resp = roundtrip(&msg).await;
+        let resp = roundtrip(addr, &msg).await;
         assert_eq!(resp.pdu.bindings[0].oid, vec![1, 3, 6, 1, 2, 1, 1, 2, 0]);
     }
 
     #[tokio::test]
     async fn getbulk_returns_rows_and_stops_at_end() {
-        let resp = roundtrip(&bulk_msg(&[&[1, 3, 6, 1, 2, 1, 1, 1, 0]], 0, 5)).await;
+        let addr = spawn_server().await;
+        let resp = roundtrip(addr, &bulk_msg(&[&[1, 3, 6, 1, 2, 1, 1, 1, 0]], 0, 5)).await;
         assert_eq!(resp.pdu.bindings.len(), 5);
 
         // Huge max-repetitions must stay bounded and EndOfMibView stops the walk.
-        let resp = roundtrip(&bulk_msg(&[&[1, 3, 6, 1, 2, 1, 9, 0]], 0, 2_000_000_000)).await;
+        let resp = roundtrip(
+            addr,
+            &bulk_msg(&[&[1, 3, 6, 1, 2, 1, 9, 0]], 0, 2_000_000_000),
+        )
+        .await;
         assert_eq!(resp.pdu.bindings.len(), 1);
         assert_eq!(resp.pdu.bindings[0].value.tag, tag::ENDOFMIBVIEW);
     }
 
     #[tokio::test]
     async fn set_ok_and_get_reflects_it() {
-        let resp = roundtrip(&set_msg(
-            5,
-            vec![VarBind {
-                oid: vec![1, 3, 6, 1, 2, 1, 1, 4, 0],
-                value: Bv::octet_string(b"ops@mini.snmp"),
-            }],
-        ))
+        let addr = spawn_server().await;
+        let resp = roundtrip(
+            addr,
+            &set_msg(
+                5,
+                vec![VarBind {
+                    oid: vec![1, 3, 6, 1, 2, 1, 1, 4, 0],
+                    value: Bv::octet_string(b"ops@mini.snmp"),
+                }],
+            ),
+        )
         .await;
         assert_eq!(resp.pdu.error_status, 0);
         assert_eq!(resp.pdu.bindings[0].value.bytes, b"ops@mini.snmp".to_vec());
 
-        let resp = roundtrip(&get_msg(6, &[1, 3, 6, 1, 2, 1, 1, 4, 0])).await;
+        let resp = roundtrip(addr, &get_msg(6, &[1, 3, 6, 1, 2, 1, 1, 4, 0])).await;
         assert_eq!(resp.pdu.bindings[0].value.bytes, b"ops@mini.snmp".to_vec());
     }
 
     #[tokio::test]
     async fn set_not_writable() {
-        let resp = roundtrip(&set_msg(
-            7,
-            vec![VarBind {
-                oid: vec![1, 3, 6, 1, 2, 1, 1, 5, 0],
-                value: Bv::octet_string(b"renamed"),
-            }],
-        ))
+        let addr = spawn_server().await;
+        let resp = roundtrip(
+            addr,
+            &set_msg(
+                7,
+                vec![VarBind {
+                    oid: vec![1, 3, 6, 1, 2, 1, 1, 5, 0],
+                    value: Bv::octet_string(b"renamed"),
+                }],
+            ),
+        )
         .await;
         assert_eq!(resp.pdu.error_status, ERR_NOTWRITABLE);
         assert_eq!(resp.pdu.error_index, 1);
@@ -544,46 +553,71 @@ mod tests {
 
     #[tokio::test]
     async fn set_wrong_value_type() {
-        let resp = roundtrip(&set_msg(
-            8,
-            vec![VarBind {
-                oid: vec![1, 3, 6, 1, 2, 1, 1, 4, 0],
-                value: Bv::integer(42),
-            }],
-        ))
+        let addr = spawn_server().await;
+        let resp = roundtrip(
+            addr,
+            &set_msg(
+                8,
+                vec![VarBind {
+                    oid: vec![1, 3, 6, 1, 2, 1, 1, 4, 0],
+                    value: Bv::integer(42),
+                }],
+            ),
+        )
         .await;
         assert_eq!(resp.pdu.error_status, ERR_WRONGVALUE);
     }
 
     #[tokio::test]
     async fn set_is_atomic_on_error() {
-        let resp = roundtrip(&set_msg(
-            9,
-            vec![
-                VarBind {
+        let addr = spawn_server().await;
+        // Plant our own sentinel so this test is independent of concurrent
+        // tests that also SET sysContact.0.
+        let resp = roundtrip(
+            addr,
+            &set_msg(
+                13,
+                vec![VarBind {
                     oid: vec![1, 3, 6, 1, 2, 1, 1, 4, 0],
-                    value: Bv::octet_string(b"new-contact"),
-                },
-                VarBind {
-                    oid: vec![1, 3, 6, 1, 2, 1, 1, 5, 0],
-                    value: Bv::octet_string(b"hacked"),
-                },
-            ],
-        ))
+                    value: Bv::octet_string(b"atomic-sentinel"),
+                }],
+            ),
+        )
+        .await;
+        assert_eq!(resp.pdu.error_status, 0);
+
+        // Multi-binding SET whose second binding fails: the first binding
+        // must NOT have been applied (atomic SET).
+        let resp = roundtrip(
+            addr,
+            &set_msg(
+                9,
+                vec![
+                    VarBind {
+                        oid: vec![1, 3, 6, 1, 2, 1, 1, 4, 0],
+                        value: Bv::octet_string(b"new-contact"),
+                    },
+                    VarBind {
+                        oid: vec![1, 3, 6, 1, 2, 1, 1, 5, 0],
+                        value: Bv::octet_string(b"hacked"),
+                    },
+                ],
+            ),
+        )
         .await;
         assert_eq!(resp.pdu.error_status, ERR_NOTWRITABLE);
         assert_eq!(resp.pdu.error_index, 2);
 
-        // First binding must NOT have been applied (atomic SET).
-        let before = roundtrip(&get_msg(12, &[1, 3, 6, 1, 2, 1, 1, 4, 0])).await;
-        let before = before.pdu.bindings[0].value.bytes.clone();
-        let resp = roundtrip(&get_msg(10, &[1, 3, 6, 1, 2, 1, 1, 4, 0])).await;
-        assert_eq!(resp.pdu.bindings[0].value.bytes, before);
+        let resp = roundtrip(addr, &get_msg(10, &[1, 3, 6, 1, 2, 1, 1, 4, 0])).await;
+        assert_eq!(
+            resp.pdu.bindings[0].value.bytes,
+            b"atomic-sentinel".to_vec()
+        );
     }
 
     #[tokio::test]
     async fn bad_community_gets_no_response() {
-        let addr = ensure_server().await;
+        let addr = spawn_server().await;
         let mut msg = get_msg(11, &[1, 3, 6, 1, 2, 1, 1, 1, 0]);
         msg.community = b"wrong".to_vec();
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
