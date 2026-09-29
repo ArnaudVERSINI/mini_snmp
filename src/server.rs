@@ -219,8 +219,8 @@ async fn handle(
             .await?;
         }
         MessageType::GetBulkRequest => {
-            let non_repeaters = (pdu.error_status.max(0) as usize).min(bindings.len());
-            let max_repetitions = (pdu.error_index.max(0) as usize).min(MAX_REPETITIONS_CAP);
+            let non_repeaters = (pdu.error_status as usize).min(bindings.len());
+            let max_repetitions = (pdu.error_index as usize).min(MAX_REPETITIONS_CAP);
             let store = store.read().await;
             let mut out: Vec<(Vec<u64>, BerValue)> = Vec::new();
 
@@ -241,18 +241,18 @@ async fn handle(
                 if active == 0 {
                     break;
                 }
-                for idx in 0..cursors.len() {
-                    let Some(cur) = cursors[idx].clone() else {
+                for cursor in cursors.iter_mut() {
+                    let Some(cur) = cursor.clone() else {
                         continue;
                     };
                     match next_in_store(&store, &cur) {
                         Some((next_oid, val)) => {
                             out.push((next_oid.clone(), val.clone()));
-                            cursors[idx] = Some(next_oid.clone());
+                            *cursor = Some(next_oid.clone());
                         }
                         None => {
                             out.push((cur, BerValue::end_of_mib_view()));
-                            cursors[idx] = None;
+                            *cursor = None;
                             active -= 1;
                         }
                     }
