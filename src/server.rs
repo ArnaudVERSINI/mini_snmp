@@ -19,14 +19,26 @@ use crate::oid::{cmp_oid, oid_from_bytes, oid_to_vec};
 
 /// Error status codes (RFC 3416).
 const ERR_NOERROR: i64 = 0;
+const ERR_NOSUCHNAME: i64 = 2;
+const ERR_WRONGVALUE: i64 = 10;
 const ERR_NOTWRITABLE: i64 = 11;
-const ERR_READONLY: i64 = 17;
 
 /// The single OID which may be modified with a SET request (sysContact.0).
 const WRITABLE_OID: &[u64] = &[1, 3, 6, 1, 2, 1, 1, 4, 0];
 
 /// Maximum SNMP datagram size.
 const MAX_SNMP_SIZE: usize = 65_500;
+
+/// Upper bound on max-repetitions accepted from a GetBulk request,
+/// to prevent a single datagram from exhausting server resources.
+const MAX_REPETITIONS_CAP: usize = 64;
+
+/// Tag of the value type expected for sysContact.0 (OCTET STRING).
+const WRITABLE_VALUE_TAG: u8 = crate::ber::tag::OCTET_STRING;
+
+fn is_v1(version: snmp2::Version) -> bool {
+    version == snmp2::Version::V1
+}
 
 /// An in-memory, mutable SNMP object store backed by a sorted map.
 pub type Store = Arc<RwLock<BTreeMap<Vec<u64>, BerValue>>>;
@@ -76,8 +88,20 @@ pub async fn run(
     store: Store,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
-    let socket = Arc::new(UdpSocket::bind(addr).await?);
-    eprintln!("SNMP server listening on {addr}");
+    let socket = UdpSocket::bind(addr).await?;
+    run_on(socket, community, store, shutdown).await
+}
+
+/// Run the SNMP server on an already-bound socket until `shutdown` is
+/// triggered (or forever if never sent).
+pub async fn run_on(
+    socket: UdpSocket,
+    community: Vec<u8>,
+    store: Store,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    let socket = Arc::new(socket);
+    eprintln!("SNMP server listening on {}", socket.local_addr()?);
     let community = Arc::new(community);
     let mut buf = vec![0u8; MAX_SNMP_SIZE];
     let mut shutdown = shutdown;
@@ -138,59 +162,99 @@ async fn handle(
     match pdu.message_type {
         MessageType::GetRequest => {
             let store = store.read().await;
+            let v1 = is_v1(version);
+            let mut err_status = ERR_NOERROR;
+            let mut err_index = 0i64;
             let out: Vec<(Vec<u64>, BerValue)> = bindings
                 .iter()
-                .map(|(oid, _)| {
+                .enumerate()
+                .map(|(i, (oid, _))| {
                     let oid_vec = oid_from_bytes(oid);
                     match store.get(&oid_vec) {
-                        Some(val) => (oid_vec.clone(), val.clone()),
-                        None => (oid_vec.clone(), BerValue::no_such_instance()),
+                        Some(val) => (oid_vec, val.clone()),
+                        None => {
+                            if v1 {
+                                err_status = ERR_NOSUCHNAME;
+                                err_index = (i + 1) as i64;
+                                (oid_vec, BerValue::null())
+                            } else {
+                                (oid_vec, BerValue::no_such_instance())
+                            }
+                        }
                     }
                 })
                 .collect();
-            send_response(socket, peer, version, community, pdu.req_id, out).await?;
+            send_response_err(
+                socket, peer, version, community, pdu.req_id, err_status, err_index, out,
+            )
+            .await?;
         }
         MessageType::GetNextRequest => {
             let store = store.read().await;
+            let v1 = is_v1(version);
+            let mut err_status = ERR_NOERROR;
+            let mut err_index = 0i64;
             let out: Vec<(Vec<u64>, BerValue)> = bindings
                 .iter()
-                .map(|(oid, _)| {
+                .enumerate()
+                .map(|(i, (oid, _))| {
                     let oid_vec = oid_from_bytes(oid);
                     match next_in_store(&store, &oid_vec) {
                         Some((next_oid, val)) => (next_oid.clone(), val.clone()),
-                        None => (oid_vec.clone(), BerValue::end_of_mib_view()),
+                        None => {
+                            if v1 {
+                                err_status = ERR_NOSUCHNAME;
+                                err_index = (i + 1) as i64;
+                                (oid_vec, BerValue::null())
+                            } else {
+                                (oid_vec, BerValue::end_of_mib_view())
+                            }
+                        }
                     }
                 })
                 .collect();
-            send_response(socket, peer, version, community, pdu.req_id, out).await?;
+            send_response_err(
+                socket, peer, version, community, pdu.req_id, err_status, err_index, out,
+            )
+            .await?;
         }
         MessageType::GetBulkRequest => {
-            let non_repeaters = pdu.error_status as usize;
-            let max_repetitions = pdu.error_index as usize;
+            let non_repeaters = (pdu.error_status.max(0) as usize).min(bindings.len());
+            let max_repetitions = (pdu.error_index.max(0) as usize).min(MAX_REPETITIONS_CAP);
             let store = store.read().await;
             let mut out: Vec<(Vec<u64>, BerValue)> = Vec::new();
 
-            let nr_count = non_repeaters.min(bindings.len());
-            for (oid, _) in bindings.iter().take(nr_count) {
+            for (oid, _) in bindings.iter().take(non_repeaters) {
                 let oid_vec = oid_from_bytes(oid);
                 match next_in_store(&store, &oid_vec) {
                     Some((next_oid, val)) => out.push((next_oid.clone(), val.clone())),
-                    None => out.push((oid_vec.clone(), BerValue::end_of_mib_view())),
+                    None => out.push((oid_vec, BerValue::end_of_mib_view())),
                 }
             }
-            let mut cursors: Vec<Vec<u64>> = bindings
+            let mut cursors: Vec<Option<Vec<u64>>> = bindings
                 .iter()
-                .skip(nr_count)
-                .map(|(oid, _)| oid_from_bytes(oid))
+                .skip(non_repeaters)
+                .map(|(oid, _)| Some(oid_from_bytes(oid)))
                 .collect();
+            let mut active = cursors.len();
             for _ in 0..max_repetitions {
-                for cursor in cursors.iter_mut() {
-                    match next_in_store(&store, cursor) {
+                if active == 0 {
+                    break;
+                }
+                for idx in 0..cursors.len() {
+                    let Some(cur) = cursors[idx].clone() else {
+                        continue;
+                    };
+                    match next_in_store(&store, &cur) {
                         Some((next_oid, val)) => {
                             out.push((next_oid.clone(), val.clone()));
-                            *cursor = next_oid.clone();
+                            cursors[idx] = Some(next_oid.clone());
                         }
-                        None => out.push((cursor.clone(), BerValue::end_of_mib_view())),
+                        None => {
+                            out.push((cur, BerValue::end_of_mib_view()));
+                            cursors[idx] = None;
+                            active -= 1;
+                        }
                     }
                 }
             }
@@ -201,29 +265,30 @@ async fn handle(
             let mut out = Vec::with_capacity(bindings.len());
             let mut err_status = ERR_NOERROR;
             let mut err_index = 0i64;
+            let mut staged: Vec<(Vec<u64>, BerValue)> = Vec::with_capacity(bindings.len());
             for (i, (oid, val)) in bindings.iter().enumerate() {
                 let oid_vec = oid_from_bytes(oid);
                 if oid_vec.as_slice() != WRITABLE_OID {
                     err_status = ERR_NOTWRITABLE;
                     err_index = (i + 1) as i64;
-                    out.push((oid_vec.clone(), BerValue::no_such_instance()));
                     break;
                 }
                 match value_from_snmp(val) {
-                    Some(bv) => {
-                        store.insert(oid_vec.clone(), bv.clone());
-                        out.push((oid_vec.clone(), bv));
+                    Some(bv) if bv.tag == WRITABLE_VALUE_TAG => {
+                        staged.push((oid_vec, bv));
                     }
-                    None => {
-                        err_status = ERR_READONLY;
+                    _ => {
+                        err_status = ERR_WRONGVALUE;
                         err_index = (i + 1) as i64;
-                        out.push((oid_vec.clone(), BerValue::no_such_instance()));
                         break;
                     }
                 }
             }
-            if err_status != ERR_NOERROR {
-                out.truncate(err_index as usize);
+            if err_status == ERR_NOERROR {
+                for (oid_vec, bv) in &staged {
+                    store.insert(oid_vec.clone(), bv.clone());
+                }
+                out = staged;
             }
             send_response_err(
                 socket, peer, version, community, pdu.req_id, err_status, err_index, out,
@@ -311,5 +376,220 @@ fn value_from_snmp(v: &snmp2::Value) -> Option<BerValue> {
         Value::Opaque(o) => Some(BerValue::new(tag::OPAQUE, o.to_vec())),
         Value::Boolean(b) => Some(BerValue::new(tag::INTEGER, vec![if *b { 1 } else { 0 }])),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ber::BerValue as Bv;
+    use crate::message::{Message, Pdu, PduType, VarBind};
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    static SERVER_ADDR: OnceLock<SocketAddr> = OnceLock::new();
+
+    async fn ensure_server() -> SocketAddr {
+        if let Some(a) = SERVER_ADDR.get() {
+            return *a;
+        }
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let _ = SERVER_ADDR.set(addr);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        std::mem::forget(tx);
+        let store = default_store();
+        tokio::spawn(async move {
+            if let Err(e) = run_on(socket, b"public".to_vec(), store, rx).await {
+                eprintln!("test server error: {e}");
+            }
+        });
+        addr
+    }
+
+    async fn roundtrip(msg: &Message) -> Message {
+        let addr = ensure_server().await;
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.send_to(&msg.encode(), addr).await.unwrap();
+        let mut buf = vec![0u8; MAX_SNMP_SIZE];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf))
+            .await
+            .expect("timeout waiting for response")
+            .unwrap();
+        Message::decode(&buf[..len]).expect("valid response")
+    }
+
+    fn get_msg(req_id: i64, oid_arcs: &[u64]) -> Message {
+        Message::v2c(
+            b"public",
+            PduType::GetRequest,
+            Pdu {
+                request_id: req_id,
+                error_status: 0,
+                error_index: 0,
+                bindings: vec![VarBind {
+                    oid: oid_arcs.to_vec(),
+                    value: Bv::null(),
+                }],
+            },
+        )
+    }
+
+    fn set_msg(req_id: i64, bindings: Vec<VarBind>) -> Message {
+        Message::v2c(
+            b"public",
+            PduType::SetRequest,
+            Pdu {
+                request_id: req_id,
+                error_status: 0,
+                error_index: 0,
+                bindings,
+            },
+        )
+    }
+
+    fn bulk_msg(oids: &[&[u64]], non_repeaters: i64, max_repetitions: i64) -> Message {
+        Message::v2c(
+            b"public",
+            PduType::GetBulkRequest,
+            Pdu {
+                request_id: 3,
+                error_status: non_repeaters,
+                error_index: max_repetitions,
+                bindings: oids
+                    .iter()
+                    .map(|o| VarBind {
+                        oid: o.to_vec(),
+                        value: Bv::null(),
+                    })
+                    .collect(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn get_existing_and_missing() {
+        let resp = roundtrip(&get_msg(1, &[1, 3, 6, 1, 2, 1, 1, 1, 0])).await;
+        assert_eq!(resp.pdu.error_status, 0);
+        assert_eq!(resp.pdu.bindings[0].value.tag, tag::OCTET_STRING);
+        assert_eq!(
+            resp.pdu.bindings[0].value.bytes,
+            b"mini_snmp test server".to_vec()
+        );
+
+        let resp = roundtrip(&get_msg(2, &[1, 3, 6, 1, 2, 1, 99, 0])).await;
+        assert_eq!(resp.pdu.bindings[0].value.tag, tag::NOSUCHINSTANCE);
+    }
+
+    #[tokio::test]
+    async fn getnext_walks_store() {
+        let msg = Message::v2c(
+            b"public",
+            PduType::GetNextRequest,
+            Pdu {
+                request_id: 4,
+                error_status: 0,
+                error_index: 0,
+                bindings: vec![VarBind {
+                    oid: vec![1, 3, 6, 1, 2, 1, 1, 1, 0],
+                    value: Bv::null(),
+                }],
+            },
+        );
+        let resp = roundtrip(&msg).await;
+        assert_eq!(resp.pdu.bindings[0].oid, vec![1, 3, 6, 1, 2, 1, 1, 2, 0]);
+    }
+
+    #[tokio::test]
+    async fn getbulk_returns_rows_and_stops_at_end() {
+        let resp = roundtrip(&bulk_msg(&[&[1, 3, 6, 1, 2, 1, 1, 1, 0]], 0, 5)).await;
+        assert_eq!(resp.pdu.bindings.len(), 5);
+
+        // Huge max-repetitions must stay bounded and EndOfMibView stops the walk.
+        let resp = roundtrip(&bulk_msg(&[&[1, 3, 6, 1, 2, 1, 9, 0]], 0, 2_000_000_000)).await;
+        assert_eq!(resp.pdu.bindings.len(), 1);
+        assert_eq!(resp.pdu.bindings[0].value.tag, tag::ENDOFMIBVIEW);
+    }
+
+    #[tokio::test]
+    async fn set_ok_and_get_reflects_it() {
+        let resp = roundtrip(&set_msg(
+            5,
+            vec![VarBind {
+                oid: vec![1, 3, 6, 1, 2, 1, 1, 4, 0],
+                value: Bv::octet_string(b"ops@mini.snmp"),
+            }],
+        ))
+        .await;
+        assert_eq!(resp.pdu.error_status, 0);
+        assert_eq!(resp.pdu.bindings[0].value.bytes, b"ops@mini.snmp".to_vec());
+
+        let resp = roundtrip(&get_msg(6, &[1, 3, 6, 1, 2, 1, 1, 4, 0])).await;
+        assert_eq!(resp.pdu.bindings[0].value.bytes, b"ops@mini.snmp".to_vec());
+    }
+
+    #[tokio::test]
+    async fn set_not_writable() {
+        let resp = roundtrip(&set_msg(
+            7,
+            vec![VarBind {
+                oid: vec![1, 3, 6, 1, 2, 1, 1, 5, 0],
+                value: Bv::octet_string(b"renamed"),
+            }],
+        ))
+        .await;
+        assert_eq!(resp.pdu.error_status, ERR_NOTWRITABLE);
+        assert_eq!(resp.pdu.error_index, 1);
+    }
+
+    #[tokio::test]
+    async fn set_wrong_value_type() {
+        let resp = roundtrip(&set_msg(
+            8,
+            vec![VarBind {
+                oid: vec![1, 3, 6, 1, 2, 1, 1, 4, 0],
+                value: Bv::integer(42),
+            }],
+        ))
+        .await;
+        assert_eq!(resp.pdu.error_status, ERR_WRONGVALUE);
+    }
+
+    #[tokio::test]
+    async fn set_is_atomic_on_error() {
+        let resp = roundtrip(&set_msg(
+            9,
+            vec![
+                VarBind {
+                    oid: vec![1, 3, 6, 1, 2, 1, 1, 4, 0],
+                    value: Bv::octet_string(b"new-contact"),
+                },
+                VarBind {
+                    oid: vec![1, 3, 6, 1, 2, 1, 1, 5, 0],
+                    value: Bv::octet_string(b"hacked"),
+                },
+            ],
+        ))
+        .await;
+        assert_eq!(resp.pdu.error_status, ERR_NOTWRITABLE);
+        assert_eq!(resp.pdu.error_index, 2);
+
+        // First binding must NOT have been applied (atomic SET).
+        let before = roundtrip(&get_msg(12, &[1, 3, 6, 1, 2, 1, 1, 4, 0])).await;
+        let before = before.pdu.bindings[0].value.bytes.clone();
+        let resp = roundtrip(&get_msg(10, &[1, 3, 6, 1, 2, 1, 1, 4, 0])).await;
+        assert_eq!(resp.pdu.bindings[0].value.bytes, before);
+    }
+
+    #[tokio::test]
+    async fn bad_community_gets_no_response() {
+        let addr = ensure_server().await;
+        let mut msg = get_msg(11, &[1, 3, 6, 1, 2, 1, 1, 1, 0]);
+        msg.community = b"wrong".to_vec();
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sock.send_to(&msg.encode(), addr).await.unwrap();
+        let mut buf = vec![0u8; 1024];
+        let res = tokio::time::timeout(Duration::from_millis(300), sock.recv_from(&mut buf)).await;
+        assert!(res.is_err(), "server must not reply to bad community");
     }
 }

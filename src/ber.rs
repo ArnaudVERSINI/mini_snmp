@@ -55,6 +55,9 @@ pub mod tag {
     pub const SET_REQUEST: u8 = 0xa3;
     pub const TRAP: u8 = 0xa4;
     pub const GETBULK_REQUEST: u8 = 0xa5;
+    pub const INFORM_REQUEST: u8 = 0xa6;
+    pub const SNMPV2_TRAP: u8 = 0xa7;
+    pub const REPORT: u8 = 0xa8;
 }
 
 /// A BER value: tag plus raw content bytes.
@@ -224,12 +227,18 @@ fn encode_u64_bytes(value: u64) -> Vec<u8> {
     bytes
 }
 
+const OID_MIN_ARCS: usize = 2;
+
 fn encode_oid_bytes(arcs: &[u64]) -> Vec<u8> {
-    if arcs.len() < 2 {
+    if arcs.len() < OID_MIN_ARCS {
         return Vec::new();
     }
+    let first_arc = match arcs[0].checked_mul(40).and_then(|v| v.checked_add(arcs[1])) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
     let mut out = Vec::new();
-    out.push((arcs[0] * 40 + arcs[1]) as u8);
+    encode_base128(first_arc, &mut out);
     for &arc in &arcs[2..] {
         encode_base128(arc, &mut out);
     }
@@ -314,7 +323,7 @@ pub fn parse_sequence(value: &BerValue) -> Result<Vec<BerValue>, BerError> {
 
 /// Decode an integer's content bytes as an `i64`.
 pub fn decode_integer(bytes: &[u8]) -> Result<i64, BerError> {
-    if bytes.is_empty() {
+    if bytes.is_empty() || bytes.len() > 8 {
         return Err(BerError::InvalidInteger);
     }
     let mut value = bytes[0] as i8 as i64;
