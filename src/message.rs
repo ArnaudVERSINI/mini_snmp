@@ -18,7 +18,8 @@ pub enum PduType {
     Trap = 0xa4,
     GetBulkRequest = 0xa5,
     InformRequest = 0xa6,
-    Report = 0xa7,
+    SnmpV2Trap = 0xa7,
+    Report = 0xa8,
 }
 
 impl PduType {
@@ -35,7 +36,8 @@ impl PduType {
             0xa4 => Some(Self::Trap),
             0xa5 => Some(Self::GetBulkRequest),
             0xa6 => Some(Self::InformRequest),
-            0xa7 => Some(Self::Report),
+            0xa7 => Some(Self::SnmpV2Trap),
+            0xa8 => Some(Self::Report),
             _ => None,
         }
     }
@@ -105,6 +107,12 @@ impl Message {
         if parts.len() != 3 {
             return Err(BerError::Truncated);
         }
+        if parts[0].tag != tag::INTEGER {
+            return Err(BerError::InvalidTag(parts[0].tag));
+        }
+        if parts[1].tag != tag::OCTET_STRING {
+            return Err(BerError::InvalidTag(parts[1].tag));
+        }
         let version = ber::decode_integer(&parts[0].bytes)?;
         let community = parts[1].bytes.clone();
         let pdu_value = parts.remove(2);
@@ -123,6 +131,9 @@ impl Message {
             let mut fields = ber::parse_sequence(&vb)?;
             if fields.len() != 2 {
                 return Err(BerError::Truncated);
+            }
+            if fields[0].tag != tag::OBJECT_IDENTIFIER {
+                return Err(BerError::InvalidTag(fields[0].tag));
             }
             let oid = ber::decode_oid(&fields[0].bytes)?;
             let value = fields.remove(1);
